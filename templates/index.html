@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>卡纸预警提前量核定 · 历史回放</title>
+<title>误报相似走势检索 · 历史回放</title>
 <style>
   :root { --line:#d8dde3; --ink:#24292f; --mut:#6a737d; --ok:#1a7f37; --bad:#cf222e; }
   * { box-sizing: border-box; }
@@ -18,36 +18,35 @@
   .flash { padding:9px 12px; border-radius:6px; margin-bottom:10px; font-size:14px;
            background:#fff8e6; border:1px solid #f0d48a; }
   label { font-size:14px; display:block; margin:10px 0 4px; }
-  input[type=text], input[type=number], textarea { font:inherit; padding:6px 8px;
-         border:1px solid var(--line); border-radius:6px; }
-  input[type=text], input[type=number] { width: 130px; }
-  textarea { width: 100%; height: 120px; font-family: ui-monospace,Consolas,monospace; }
+  input[type=text], input[type=number] { font:inherit; padding:6px 8px;
+         border:1px solid var(--line); border-radius:6px; width: 130px; }
   button { font:inherit; padding:7px 16px; border:0; border-radius:6px; cursor:pointer;
            background:#1f6feb; color:#fff; }
   button.ghost { background:#eaeef2; color:var(--ink); }
+  button.small { padding:3px 10px; font-size:12px; }
   .row { display:flex; gap:26px; flex-wrap:wrap; align-items:flex-end; }
   .hint { color:var(--mut); font-size:12px; margin-top:4px; }
   table { border-collapse: collapse; font-size: 13px; margin: 8px 0; }
   th, td { border:1px solid var(--line); padding:5px 10px; text-align:center; }
   th { background:#f0f3f6; }
-  .banner { padding:12px 16px; border-radius:8px; font-size:17px; font-weight:600; margin:6px 0 10px; }
-  .banner.ok { background:#dafbe1; border:1px solid #2da44e; color:var(--ok); }
-  .banner.bad { background:#ffebe9; border:1px solid #fa8c8c; color:var(--bad); }
   .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
   .tag.ok { background:#dafbe1; color:var(--ok); }
+  .tag.rev { background:#f1e8ff; color:#6f3dc0; }
   .tag.off { background:#eaeef2; color:var(--mut); }
   .chart { border:1px solid var(--line); border-radius:6px; background:#fff; padding:6px; }
   .replay { display:flex; gap:12px; align-items:center; margin-top:8px; font-size:13px; }
   .replay input[type=range] { flex:1; }
   #readout { font-family: ui-monospace,Consolas,monospace; white-space:nowrap; }
-  details { font-size:13px; margin:6px 0; }
   code { background:#eff1f3; padding:1px 5px; border-radius:4px; }
+  form.inline { display:inline; }
+  .meta { font-size:12px; color:var(--mut); }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>卡纸预警提前量核定 · 历史回放</h1>
-  <div class="sub">上传逐分钟模型分数，核定“任一组卡纸时刻都至少命中 K 次”的最大提前量 L（1≤L≤U）。每段连续达标只在首分钟告警；计算不枚举时刻组合。</div>
+  <h1>误报相似走势检索 · 历史回放</h1>
+  <div class="sub">在回放页框选误报样本的起止分钟（连续 {{ min_len }}～{{ max_len }} 分钟），各片段减去本段首分钟分数后做受限 DTW
+    （对齐位置在各自片段内的偏移量至多相差 2 分钟），在距离上限与复核名额（{{ min_quota }}～{{ max_quota }}）内挑出互不重叠的相似片段。</div>
 
   {% with messages = get_flashed_messages() %}
     {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
@@ -60,7 +59,8 @@
       <button type="submit">上传</button>
       <a href="{{ url_for('sample') }}" style="margin-left:10px">下载示例 CSV</a>
     </form>
-    <div class="hint">两列：<code>分钟号,整数分数</code>（可含表头）；分钟号须连续（步长 1）；最多 {{ max_rows }} 行。</div>
+    <div class="hint">两列：<code>分钟号,整数分数</code>（可含表头）；分钟号须连续（步长 1）；最多 {{ max_rows }} 行。
+      成功换 CSV 会清空原名单与复核标记。</div>
     {% if data %}
     <p style="font-size:14px">已加载：<b>{{ data.name }}</b>（{{ data.uploaded_at }}）　{{ data.minutes|length }} 行，
       分钟 {{ data.minutes[0] }} ~ {{ data.minutes[-1] }}，分数 {{ data.scores|min }} ~ {{ data.scores|max }}。</p>
@@ -69,22 +69,22 @@
 
   {% if data %}
   <section>
-    <h2>② 填写参数与卡纸记录</h2>
-    <form method="post" action="{{ url_for('analyze') }}">
+    <h2>② 检索条件</h2>
+    <form method="post" action="{{ url_for('search') }}">
       <div class="row">
-        <div><label>告警阈值（分数 ≥ 阈值即达标）</label>
-          <input type="text" name="threshold" value="{{ form.threshold }}" required></div>
-        <div><label>有效提前量上限 U（分钟）</label>
-          <input type="number" name="U" min="1" value="{{ form.U }}" required></div>
-        <div><label>至少命中次数 K</label>
-          <input type="number" name="K" min="1" value="{{ form.K }}" required></div>
+        <div><label>样本起始分钟</label>
+          <input type="text" name="start_min" value="{{ form.start_min }}" required></div>
+        <div><label>样本结束分钟</label>
+          <input type="text" name="end_min" value="{{ form.end_min }}" required></div>
+        <div><label>距离上限（累计绝对差）</label>
+          <input type="text" name="max_dist" value="{{ form.max_dist }}" required></div>
+        <div><label>复核名额（{{ min_quota }}～{{ max_quota }}）</label>
+          <input type="number" name="quota" min="{{ min_quota }}" max="{{ max_quota }}"
+                 value="{{ form.quota }}" required></div>
       </div>
-      <label>卡纸可能时刻区间（每行一段；最多 {{ max_jams }} 段，每段至多 {{ max_span }} 个分钟号，各段互不重叠）</label>
-      <textarea name="intervals" placeholder="如：&#10;125-130&#10;250 254&#10;370（单分钟）"
->{% if form.intervals %}{% for a,b in form.intervals %}{{ a }}-{{ b }}
-{% endfor %}{% endif %}</textarea>
-      <div class="hint">每组卡纸时刻 = 各区间各取一分钟；只用卡纸前 L～U 分钟的告警做一对一配对。</div>
-      <p><button type="submit">核定最大可承诺提前量 L</button></p>
+      <div class="hint">样本为闭区间连续片段，长度须在 {{ min_len }}～{{ max_len }} 分钟之间；
+        候选为等长滑动窗口，不能与样本或任一已复核区段相交。</div>
+      <p><button type="submit">检索相似片段</button></p>
     </form>
   </section>
 
@@ -99,84 +99,101 @@
   </section>
   {% endif %}
 
-  {% if current %}
-  {% set r = current.result %}
+  {% if query %}
   <section>
-    <h2>④ 核定结论 <span class="tag ok">当前有效</span>
-      <span style="font-weight:400;font-size:12px;color:#6a737d">#{{ current.id }} · {{ current.time }} · 数据 {{ current.data_name }} · 阈值 {{ current.params.threshold }} · U={{ current.params.U }} · K={{ current.params.K }} · 耗时 {{ r.elapsed_ms }}ms</span></h2>
+    <h2>④ 候选与复核名单
+      <span class="meta">#{{ query.time }} · 样本 {{ query.sample_start_min }}~{{ query.sample_end_min }}
+        （{{ query.length }} 分钟）· 上限 {{ query.params.max_dist }} · 名额 {{ query.params.quota }}
+        · 候选 {{ query.candidates|length }} 段 · DTW {{ query.elapsed_ms }}ms</span></h2>
 
-    {% if r.status == 'ok' %}
-      <div class="banner ok">可承诺：L = {{ r.L }} 分钟（1≤L≤U={{ r.U }} 范围内的最大值）。任意卡纸时刻组合至少命中 {{ r.min_hits }} 次 ≥ K={{ r.K }}。</div>
-      {% if r.counter %}
-      <p>但 <b>L={{ r.counter.L }}</b> 档已无法保证：下面这组卡纸时刻只命中 <b>{{ r.counter.hits }}</b> 次（&lt; K={{ r.K }}），为其最佳配对：</p>
-      {% endif %}
-    {% else %}
-      <div class="banner bad">无法承诺：连 L=1 档都存在卡纸时刻组合命中不足 K={{ r.K }} 次（下例仅命中 {{ r.counter.hits }} 次）。{% if r.reason == 'no_alerts' %}（当前阈值下没有任何告警。）{% endif %}</div>
-      <p>反例（L={{ r.counter.L }} 档）及其最佳配对：</p>
-    {% endif %}
-
-    {% if r.counter %}
-    {% set c = r.counter %}
+    {% if query.selection %}
+    <p>名单按“先尽量多选互不重叠片段，数量相同取总距离最小”选出；点 <b>标为已复核</b>
+      后将用原查询从全部候选重选并更新名单与标记。</p>
     <table>
-      <tr><th>卡纸</th><th>可能区间</th><th>反例取值</th><th>配对告警</th><th>提前量</th></tr>
-      {% for row in c.rows %}
+      <tr><th>序号</th><th>起始分钟</th><th>结束分钟</th><th>DTW 距离</th><th>操作</th></tr>
+      {% for c in query.selection %}
       <tr>
-        <td>卡{{ row.jam + 1 }}</td>
-        <td>[{{ row.a }}, {{ row.b }}]</td>
-        <td>{{ row.t }}</td>
-        {% if row.alert is not none %}<td>{{ row.alert }}</td><td>{{ row.lead }} 分钟</td>
-        {% else %}<td colspan="2" style="color:#cf222e">未配对</td>{% endif %}
+        <td>{{ loop.index }}</td>
+        <td>{{ c.start_min }}</td>
+        <td>{{ c.end_min }}</td>
+        <td>{{ c.distance }}</td>
+        <td>
+          <form class="inline" method="post" action="{{ url_for('review') }}">
+            <input type="hidden" name="token" value="{{ query.token }}">
+            <input type="hidden" name="start" value="{{ c.start }}">
+            <input type="hidden" name="end" value="{{ c.end }}">
+            <button type="submit" class="small">标为已复核</button>
+          </form>
+        </td>
       </tr>
       {% endfor %}
-      <tr><th colspan="5">合计命中 {{ c.hits }} 次（共 {{ r.m }} 次卡纸）</th></tr>
+      <tr><th colspan="3">合计</th><th>{{ query.selection | sum(attribute='distance') }}</th><th></th></tr>
     </table>
+    {% else %}
+    <p><span class="tag off">名单为空</span>
+      当前查询没有可选片段（候选数 {{ query.candidates|length }}；已复核区段 {{ reviewed|length }} 段）。
+      可调大距离上限或清空回放后重新检索。</p>
     {% endif %}
 
     <details>
-      <summary>本档参数下共 {{ r.n_alerts }} 条告警（每段连续达标只计首分钟）</summary>
-      <p style="font-family:ui-monospace,Consolas,monospace">{{ r.alerts | join(', ') }}</p>
+      <summary>全部候选（{{ query.candidates|length }} 段，淡蓝色带；含与名单互斥未入选者）</summary>
+      <table>
+        <tr><th>候选</th><th>起始分钟</th><th>结束分钟</th><th>距离</th><th>状态</th></tr>
+        {% set picked = {} %}
+        {% for c in query.selection %}{% set _ = picked.update({(c.start, c.end): True}) %}{% endfor %}
+        {% for c in query.candidates %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td>{{ data.minutes[c.start] }}</td>
+          <td>{{ data.minutes[c.end] }}</td>
+          <td>{{ c.distance }}</td>
+          {% if picked.get((c.start, c.end)) %}
+            <td><span class="tag ok">名单内</span></td>
+          {% else %}
+            <td><span class="tag off">未入选（重叠/名额）</span></td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </table>
     </details>
   </section>
-  {% endif %}
 
-  {% if history %}
   <section>
-    <h2>⑤ 历史结论（已撤下）</h2>
+    <h2>⑤ 已复核区段（{{ reviewed|length }} 段）</h2>
+    {% if reviewed %}
     <table>
-      <tr><th>#</th><th>时间</th><th>数据</th><th>参数</th><th>结论</th><th>状态</th></tr>
-      {% for e in history %}
-      <tr>
-        <td>{{ e.id }}</td><td>{{ e.time }}</td>
-        <td>{{ e.data_name }}（{{ e.data_rows }}行）</td>
-        <td>阈值{{ e.params.threshold }} U={{ e.params.U }} K={{ e.params.K }} 区间{{ e.params.intervals|length }}段</td>
-        <td>{{ summarize(e) }}</td>
-        <td><span class="tag off">已撤下</span><br><span style="font-size:11px;color:#6a737d">{{ e.withdraw_reason }}</span></td>
-      </tr>
+      <tr><th>序号</th><th>起始分钟</th><th>结束分钟</th></tr>
+      {% for a, b in reviewed %}
+      <tr><td>{{ loop.index }}</td><td>{{ a }}</td><td>{{ b }}</td></tr>
       {% endfor %}
     </table>
+    <div class="hint">已复核区段不会再出现在名单中；重选失败时新增标记与名单变更都会回滚。</div>
+    {% else %}
+    <p class="meta">尚无已复核区段。</p>
+    {% endif %}
   </section>
   {% endif %}
 
-  <form method="post" action="{{ url_for('reset') }}" onsubmit="return confirm('清空当前会话的数据与全部结论？')">
-    <button type="submit" class="ghost">清空重来</button>
+  <form method="post" action="{{ url_for('reset') }}" onsubmit="return confirm('清空回放：数据、名单与复核标记将全部清除？')">
+    <button type="submit" class="ghost">清空回放</button>
   </form>
 </div>
 
 {% if replay %}
-<script type="application/json" id="replay-data">{{ replay|safe }}</script>
+<script type="application/json" id="replay-data">{{ replay | tojson }}</script>
 <script>
 (function () {
   var d = JSON.parse(document.getElementById('replay-data').textContent);
   var slider = document.getElementById('slider');
   var readout = document.getElementById('readout');
   var cursor = document.getElementById('cursor');
-  var g = d.geom, alerts = new Set(d.alerts);
+  var g = d.geom;
   function show() {
     var i = +slider.value, m = d.minutes[i], s = d.scores[i];
     var x = g.ml + (m - g.x0) * g.pw / (g.x1 - g.x0);
     cursor.setAttribute('x1', x); cursor.setAttribute('x2', x);
     cursor.style.display = 'block';
-    readout.textContent = '分钟 ' + m + ' · 分数 ' + s + (alerts.has(m) ? ' · ⚠ 告警' : '');
+    readout.textContent = '分钟 ' + m + ' · 分数 ' + s;
   }
   slider.addEventListener('input', show);
   show();

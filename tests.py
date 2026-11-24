@@ -1,176 +1,205 @@
-"""核心算法自测：与暴力枚举全部时刻组合的结果交叉验证。
+"""核心算法与网页端自测。
 
 运行：python3 tests.py
+
+对照方式：
+  - DTW：受限结果与同实现的“无约束大带宽”结果、以及独立朴素实现交叉验证；
+  - 名额选择：带基数的区间调度 DP 与 itertools 枚举全部子集的结果对照；
+  - 网页：Flask 测试客户端走通 上传 -> 检索 -> 复核重选 -> 失败回滚 ->
+    旧 token 拦截 -> 换 CSV 清空 全流程。
 """
 import itertools
 import random
 
-from core import (compute_alerts, counterexample, max_matching, min_hits,
-                  solve)
+import core
 
 
-def brute_max_matching(combo, alerts, L, U):
-    """增广路求二分图最大匹配（暴力，供对照）。"""
-    adj = []
-    for t in combo:
-        lo, hi = t - U, t - L
-        adj.append([a for a in alerts if lo <= a <= hi])
-    match_of_alert = {}
+# ---------------------------------------------------------------- 独立朴素实现
 
-    def aug(i, seen):
-        for a in adj[i]:
-            if a in seen:
+def naive_dtw(a, b, band):
+    """独立的朴素受限 DTW：用 INF 矩阵直接按定义计算，不共享 core 的循环写法。"""
+    n = len(a)
+    inf = float("inf")
+    d = [[inf] * n for _ in range(n)]
+    d[0][0] = abs(a[0] - b[0])
+    for i in range(n):
+        for j in range(n):
+            if i == j == 0 or abs(i - j) > band:
                 continue
-            seen.add(a)
-            if a not in match_of_alert or aug(match_of_alert[a], seen):
-                match_of_alert[a] = i
-                return True
-        return False
+            preds = []
+            if i > 0 and abs(i - 1 - j) <= band:
+                preds.append(d[i - 1][j])
+            if j > 0 and abs(i - (j - 1)) <= band:
+                preds.append(d[i][j - 1])
+            if i > 0 and j > 0 and abs(i - 1 - (j - 1)) <= band:
+                preds.append(d[i - 1][j - 1])
+            if all(p == inf for p in preds):
+                continue
+            d[i][j] = min(preds) + abs(a[i] - b[j])
+    return d[n - 1][n - 1]
 
-    cnt = 0
-    for i in range(len(combo)):
-        if aug(i, set()):
-            cnt += 1
-    return cnt
 
-
-def brute_min_hits(L, alerts, intervals, U):
-    """枚举全部时刻组合，取最大配对数的最小值（暴力，供对照）。"""
+def brute_select(candidates, blocked, quota):
+    """枚举全部子集，按 数量优先、总距离最小、下标字典序 选最优。"""
     best = None
-    for combo in itertools.product(*[range(a, b + 1) for a, b in intervals]):
-        v = brute_max_matching(list(combo), alerts, L, U)
-        best = v if best is None else min(best, v)
-    return best
+    cands = [c for c in candidates
+             if not any(core.intersects(c["start"], c["end"], a, b)
+                        for a, b in blocked)]
+    for r in range(min(quota, len(cands)) + 1):
+        for combo in itertools.combinations(range(len(cands)), r):
+            ok = True
+            for x, y in zip(combo, combo[1:]):
+                if core.intersects(cands[x]["start"], cands[x]["end"],
+                                   cands[y]["start"], cands[y]["end"]):
+                    ok = False
+                    break
+            if not ok:
+                continue
+            total = sum(cands[i]["distance"] for i in combo)
+            key = (len(combo), -total, tuple(-i for i in combo))
+            if best is None or key > best[0]:
+                best = (key, [cands[i] for i in combo])
+    return best[1] if best else []
 
 
-def test_compute_alerts():
-    minutes = [10, 11, 12, 13, 14, 15, 16, 17]
-    scores = [5, 9, 9, 8, 2, 8, 7, 1]
-    assert compute_alerts(minutes, scores, 8) == [11, 15]
-    assert compute_alerts(minutes, scores, 10) == []
-    assert compute_alerts(minutes, scores, 1) == [10]  # 整段只在首分钟告警
-    print("ok  compute_alerts")
+# ---------------------------------------------------------------- DTW 测试
+
+def test_dtw_basic():
+    # 相同序列距离为 0；归一化后“整体平移但走势相同”的距离也为 0
+    a = [3, 5, 9, 8, 2, 4, 6, 1]
+    b = [13, 15, 19, 18, 12, 14, 16, 11]
+    assert core.dtw_distance(a, a) == 0
+    assert core.dtw_distance(core.normalize(a), core.normalize(b)) == 0
+    # 与朴素实现、无约束实现一致
+    rng = random.Random(20261124)
+    for n in range(1, 13):
+        for _ in range(50):
+            x = [rng.randint(-10, 10) for _ in range(n)]
+            y = [rng.randint(-10, 10) for _ in range(n)]
+            got = core.dtw_distance(x, y, core.BAND)
+            assert got == naive_dtw(x, y, core.BAND)
+            free = core.dtw_distance(x, y, n - 1)
+            assert free == naive_dtw(x, y, n - 1)
+            assert got >= free  # 加约束只会让最优距离变大或相等
+    print("ok  dtw_distance：归一化平移不变、与朴素实现一致、约束距离 >= 无约束距离")
 
 
-def test_max_matching_vs_brute(rng, trials=300):
+def test_dtw_band_effect():
+    # 峰值分别在两端：无约束可把峰值错开到不同偏移对齐；带宽 2 时被迫错位对齐，
+    # 累计绝对差显著变大
+    a = [0, 10, 0, 0, 0, 0, 0, 0, 0, 0]
+    b = [0, 0, 0, 0, 0, 0, 0, 0, 10, 0]
+    banded = core.dtw_distance(a, b, 2)
+    free = core.dtw_distance(a, b, 9)
+    assert banded > free
+    # 带宽 2 时偏移差不允许超过 2：构造仅在偏移差 4 才能零代价对齐的序列
+    x = [0, 5, 5, 5, 5, 5, 5, 5]
+    y = [0, 0, 0, 0, 5, 5, 5, 5]
+    assert core.dtw_distance(x, y, 2) > core.dtw_distance(x, y, 7)
+    print(f"ok  带宽约束生效：峰值两端例 banded={banded} > free={free}")
+
+
+# ---------------------------------------------------------------- 候选与选择测试
+
+def test_find_candidates(rng):
+    n = 120
+    scores = [rng.randint(0, 60) for _ in range(n)]
+    s, e = 10, 21  # 12 分钟样本
+    for limit in (0, 5, 15, 40):
+        cands = core.find_candidates(scores, s, e, limit)
+        starts = {c["start"] for c in cands}
+        # 样本自身及与之相交的窗口全部排除
+        for c in cands:
+            assert not core.intersects(s, e, c["start"], c["end"])
+            assert c["end"] - c["start"] + 1 == e - s + 1
+            assert c["distance"] <= limit
+        # 与逐窗口独立复算一致
+        expect = set()
+        sample = core.normalize(scores[s:e + 1])
+        for w in range(n - (e - s)):
+            we = w + (e - s)
+            if core.intersects(s, e, w, we):
+                continue
+            d = core.dtw_distance(sample, core.normalize(scores[w:we + 1]), core.BAND)
+            if d <= limit:
+                expect.add(w)
+        assert starts == expect
+    print("ok  find_candidates：等长、不相交、距离达标，与独立复算一致")
+
+
+def test_select_vs_brute(rng, trials=400):
     for _ in range(trials):
-        n = rng.randint(0, 12)
-        alerts = sorted(rng.sample(range(0, 40), n))
-        m = rng.randint(1, 5)
-        U = rng.randint(1, 8)
-        L = rng.randint(1, U)
-        combo = [rng.randint(0, 40) for _ in range(m)]
-        g = len(max_matching(combo, alerts, L, U))
-        b = brute_max_matching(combo, alerts, L, U)
-        assert g == b, (combo, alerts, L, U, g, b)
-    print("ok  max_matching == brute_max_matching")
-
-
-def test_min_hits_vs_brute(rng, trials=400):
-    for _ in range(trials):
-        n = rng.randint(0, 10)
-        alerts = sorted(rng.sample(range(0, 30), n))
-        m = rng.randint(1, 4)
-        U = rng.randint(1, 7)
-        L = rng.randint(1, U)
-        # 互不重叠的小区间
-        intervals = []
-        cur = rng.randint(0, 3)
-        for _ in range(m):
+        n = rng.randint(1, 14)
+        length = rng.randint(3, 6)
+        used, cands = set(), []
+        for i in range(n):
+            s = rng.randint(0, 60)
+            c = {"start": s, "end": s + length - 1,
+                 "distance": rng.randint(0, 20)}
+            cands.append(c)
+        # 去重，模拟等长滑动窗口（起点唯一）
+        if s in used:
+            continue
+        used.add(s)
+        cands.sort(key=lambda c: c["start"])
+        nb = rng.randint(0, 3)
+        blocked = []
+        cur = rng.randint(0, 5)
+        for _ in range(nb):
             a = cur
-            b = a + rng.randint(0, 3)
-            intervals.append((a, b))
-            cur = b + rng.randint(1, 4)
-        got = min_hits(L, alerts, intervals, U)
-        want = brute_min_hits(L, alerts, intervals, U)
-        assert got == want, (L, alerts, intervals, U, got, want)
-        # 反例组合的配对数应恰好等于 min_hits
-        combo, pairs = counterexample(L, alerts, intervals, U)
-        assert len(pairs) == want, (L, alerts, intervals, U, combo, pairs, want)
-        # 反例组合必须取自各区间
-        for (a, b), t in zip(intervals, combo):
-            assert a <= t <= b
-    print("ok  min_hits/counterexample == brute force (400 组随机)")
+            b = a + rng.randint(0, 4)
+            blocked.append((a, b))
+            cur = b + rng.randint(0, 5)
+        quota = rng.randint(1, 10)
+        got = core.select_segments(cands, blocked, quota)
+        want = brute_select(cands, blocked, quota)
+        assert [(c["start"], c["distance"]) for c in got] == \
+               [(c["start"], c["distance"]) for c in want], \
+            (cands, blocked, quota, got, want)
+        # 结果必须互不重叠且不碰 blocked
+        for i, c in enumerate(got):
+            assert all(not core.intersects(c["start"], c["end"], a, b)
+                       for a, b in blocked)
+            for c2 in got[i + 1:]:
+                assert not core.intersects(c["start"], c["end"],
+                                           c2["start"], c2["end"])
+        assert len(got) <= quota
+    print("ok  select_segments 与枚举全部子集一致（400 组随机）")
 
 
-def test_solve_vs_linear(rng, trials=120):
-    for _ in range(trials):
-        n = rng.randint(0, 10)
-        alerts = sorted(rng.sample(range(0, 30), n))
-        m = rng.randint(1, 4)
-        U = rng.randint(1, 8)
-        K = rng.randint(1, m + 2)
-        intervals = []
-        cur = rng.randint(0, 3)
-        for _ in range(m):
-            a = cur
-            b = a + rng.randint(0, 3)
-            intervals.append((a, b))
-            cur = b + rng.randint(1, 4)
-        res = solve(alerts, intervals, U, K)
-        # 线性扫描对照
-        mh = {L: brute_min_hits(L, alerts, intervals, U) for L in range(1, U + 1)}
-        feasible = [L for L in range(1, U + 1) if mh[L] >= K]
-        if not feasible:
-            assert res["status"] == "infeasible", (res, mh, K)
-            c = res["counter"]
-            assert c["L"] == 1 and c["hits"] == mh[1] < K
-        else:
-            Lstar = max(feasible)
-            assert res["status"] == "ok" and res["L"] == Lstar, (res, mh, K)
-            assert res["min_hits"] == mh[Lstar]
-            if Lstar < U:
-                c = res["counter"]
-                assert c["L"] == Lstar + 1 and c["hits"] == mh[Lstar + 1] < K
-            else:
-                assert "counter" not in res
-    print("ok  solve == 线性扫描暴力解 (120 组随机)")
+def test_select_objective_order():
+    # 数量优先：即便单段距离更小，也应选更多段
+    cands = [
+        {"start": 0, "end": 2, "distance": 1},
+        {"start": 3, "end": 5, "distance": 1},
+        {"start": 6, "end": 8, "distance": 1},
+    ]
+    sel = core.select_segments(cands, [], 10)
+    assert len(sel) == 3 and sum(c["distance"] for c in sel) == 3
+    # 数量相同取总距离最小：重叠对中选距离小的
+    cands = [
+        {"start": 0, "end": 3, "distance": 9},
+        {"start": 2, "end": 5, "distance": 2},   # 与上者重叠，距离更小
+        {"start": 6, "end": 9, "distance": 1},
+    ]
+    sel = core.select_segments(cands, [], 10)
+    assert [c["start"] for c in sel] == [2, 6]
+    # 名额截断
+    sel = core.select_segments(
+        [{"start": i * 4, "end": i * 4 + 2, "distance": 1} for i in range(6)],
+        [], 2)
+    assert len(sel) == 2
+    # blocked 生效
+    sel = core.select_segments(
+        [{"start": 0, "end": 2, "distance": 1},
+         {"start": 3, "end": 5, "distance": 1}], [(3, 5)], 10)
+    assert [c["start"] for c in sel] == [0]
+    print("ok  选择目标：数量优先、同数量总距离最小、名额与 blocked 生效")
 
 
-def test_monotonicity(rng, trials=60):
-    for _ in range(trials):
-        n = rng.randint(0, 12)
-        alerts = sorted(rng.sample(range(0, 40), n))
-        m = rng.randint(1, 5)
-        U = rng.randint(1, 10)
-        intervals = []
-        cur = rng.randint(0, 3)
-        for _ in range(m):
-            a = cur
-            b = a + rng.randint(0, 3)
-            intervals.append((a, b))
-            cur = b + rng.randint(1, 4)
-        seq = [min_hits(L, alerts, intervals, U) for L in range(1, U + 1)]
-        assert all(seq[i] >= seq[i + 1] for i in range(len(seq) - 1)), seq
-    print("ok  min_hits 关于 L 单调不增")
-
-
-def test_edge_cases():
-    # 无告警 -> 无法承诺
-    res = solve([], [(10, 12)], 5, 1)
-    assert res["status"] == "infeasible" and res["counter"]["hits"] == 0
-    # K 大于卡纸数 -> 无法承诺（告警 6/7/8 能覆盖 [10,12] 的任一时刻，但最多配对 1 次）
-    res = solve([6, 7, 8], [(10, 12)], 5, 2)
-    assert res["status"] == "infeasible" and res["counter"]["hits"] == 1
-    # 告警远早于所有卡纸（提前量永远不够）-> 无法承诺
-    res = solve([1, 2], [(100, 105)], 5, 1)
-    assert res["status"] == "infeasible"
-    # 告警提前量为 3/4/5 分钟 -> 最大可承诺 L=5，L=6 档反例配对 0 次
-    res = solve([95, 96, 97], [(100, 100)], 10, 1)
-    assert res["status"] == "ok" and res["L"] == 5
-    assert res["counter"]["L"] == 6 and res["counter"]["hits"] == 0
-    # 告警恰好都在窗口内 -> L 可取到 U
-    res = solve([90], [(100, 100)], 10, 1)
-    assert res["status"] == "ok" and res["L"] == 10 and "counter" not in res
-    # U 大于可达提前量时被截断，且给出 L+1 反例
-    res = solve([90], [(100, 100)], 50, 1)
-    assert res["status"] == "ok" and res["L"] == 10
-    assert res["counter"]["L"] == 11 and res["counter"]["hits"] == 0
-    print("ok  边界情形")
-
+# ---------------------------------------------------------------- 网页端冒烟
 
 def test_web_app():
-    """用 Flask 测试客户端走通：上传 -> 核定 -> 更正撤下 -> 无法承诺 -> 校验拦截。"""
     import io as _io
 
     import app as web
@@ -186,46 +215,135 @@ def test_web_app():
                content_type="multipart/form-data", follow_redirects=True)
     assert "已加载" in r.get_data(as_text=True)
 
-    # 演示参数：可承诺 L=60，L=61 档反例命中 4 次
-    iv = "125-130\n250-254\n370-374\n480-484\n600-604\n705-709"
-    r = c.post("/analyze", data={"threshold": "80", "U": "90", "K": "5",
-                                 "intervals": iv}, follow_redirects=True)
-    html = r.get_data(as_text=True)
-    assert "可承诺：L = 60 分钟" in html
-    assert "任意卡纸时刻组合至少命中 5 次" in html
-    assert "合计命中 4 次（共 6 次卡纸）" in html
+    # 非法参数被拦截
+    r = c.post("/search", data={"start_min": "40", "end_min": "44",
+                                "max_dist": "20", "quota": "5"},
+               follow_redirects=True)
+    assert "8~30 分钟" in r.get_data(as_text=True)
+    r = c.post("/search", data={"start_min": "40", "end_min": "51",
+                                "max_dist": "20", "quota": "11"},
+               follow_redirects=True)
+    assert "复核名额" in r.get_data(as_text=True)
 
-    # 更正区间：旧结论撤下并出现在历史
-    r = c.post("/analyze", data={"threshold": "80", "U": "90", "K": "5",
-                                 "intervals": "126-130\n250-254\n370-374\n480-484\n600-604\n705-709"},
+    # 正式检索：样本 40~51、上限 20、名额 10 -> 9 段互不重叠名单
+    r = c.post("/search", data={"start_min": "40", "end_min": "51",
+                                "max_dist": "20", "quota": "10"},
                follow_redirects=True)
     html = r.get_data(as_text=True)
-    assert "已撤下" in html and "参数或卡纸区间已更正" in html
+    assert "候选 14 段" in html and "名单入选 9 段" in html
+    # 从 STORE 直接核对名单互不重叠
+    with c.session_transaction() as sess:
+        st = web.STORE[sess["sid"]]
+    q = st["query"]
+    token = q["token"]
+    sel = q["selection"]
+    assert len(sel) == 9
+    for i, x in enumerate(sel):
+        for y in sel[i + 1:]:
+            assert not core.intersects(x["start"], x["end"], y["start"], y["end"])
+    assert sum(x["distance"] for x in sel) == 108
+    first = sel[0]
 
-    # K=7 超过卡纸数：无法承诺
-    r = c.post("/analyze", data={"threshold": "80", "U": "90", "K": "7",
-                                 "intervals": iv}, follow_redirects=True)
-    assert "无法承诺" in r.get_data(as_text=True)
+    # 复核第一段：用原查询从全部候选重选，名单少 1 段、标记 +1
+    r = c.post("/review", data={"token": token, "start": first["start"],
+                                "end": first["end"]}, follow_redirects=True)
+    assert "标为已复核" in r.get_data(as_text=True)
+    with c.session_transaction() as sess:
+        st = web.STORE[sess["sid"]]
+    assert (first["start"], first["end"]) in st["reviewed"]
+    assert all(not (x["start"] == first["start"] and x["end"] == first["end"])
+               for x in st["query"]["selection"])
+    assert len(st["query"]["selection"]) == 8
 
-    # 非法输入被拦截
-    r = c.post("/upload", data={"file": (_io.BytesIO(b"minute,score\n1,50\n3,60\n"), "b.csv")},
+    # 旧 token 提交：要求重新检索，状态不变
+    r = c.post("/review", data={"token": "stale-token",
+                                "start": first["start"], "end": first["end"]},
+               follow_redirects=True)
+    assert "重新检索" in r.get_data(as_text=True)
+    with c.session_transaction() as sess:
+        st = web.STORE[sess["sid"]]
+    assert len(st["reviewed"]) == 1
+
+    # 重选失败回滚：上限 8 时只有 2 段候选，连续复核到选不出时必须保留原名单与标记
+    c.post("/search", data={"start_min": "40", "end_min": "51",
+                            "max_dist": "8", "quota": "10"},
+           follow_redirects=True)
+    with c.session_transaction() as sess:
+        st = web.STORE[sess["sid"]]
+    q2 = st["query"]
+    assert len(q2["candidates"]) == 2 and len(q2["selection"]) == 2
+    # 先复核第一段 -> 只剩另一段
+    a0 = q2["selection"][0]
+    c.post("/review", data={"token": q2["token"], "start": a0["start"],
+                            "end": a0["end"]}, follow_redirects=True)
+    with c.session_transaction() as sess:
+        st = web.STORE[sess["sid"]]
+    assert len(st["query"]["selection"]) == 1
+    # 再复核最后一段 -> 重选为空，回滚：名单与标记恢复到本次操作前
+    a1 = st["query"]["selection"][0]
+    before_rev = [tuple(x) for x in st["reviewed"]]
+    before_sel = [dict(x) for x in st["query"]["selection"]]
+    r = c.post("/review", data={"token": q2["token"], "start": a1["start"],
+                                "end": a1["end"]}, follow_redirects=True)
+    assert "重选失败" in r.get_data(as_text=True)
+    with c.session_transaction() as sess:
+        st = web.STORE[sess["sid"]]
+    assert st["reviewed"] == before_rev
+    assert st["query"]["selection"] == before_sel
+    # 回滚后仍是上限 8 查询的 1 段名单，而不是更早的上限 20 名单
+    assert [x["start"] for x in st["query"]["selection"]] == \
+           [x["start"] for x in before_sel]
+    # 回滚后重复提交同一段：仍失败、仍回滚，且不触发类型错误（回归保护）
+    r = c.post("/review", data={"token": q2["token"], "start": a1["start"],
+                                "end": a1["end"]}, follow_redirects=True)
+    assert r.status_code == 200 and "重选失败" in r.get_data(as_text=True)
+    with c.session_transaction() as sess:
+        st = web.STORE[sess["sid"]]
+    assert st["reviewed"] == before_rev
+    assert st["query"]["selection"] == before_sel
+
+    # 换 CSV：名单与标记清空
+    r = c.post("/upload", data={"file": (_io.BytesIO(to_csv().encode()), "s2.csv")},
                content_type="multipart/form-data", follow_redirects=True)
-    assert "分钟号不连续" in r.get_data(as_text=True)
-    r = c.post("/analyze", data={"threshold": "80", "U": "90", "K": "5",
-                                 "intervals": "125-130\n128-135"},
+    assert "旧名单与复核标记已清空" in r.get_data(as_text=True)
+    with c.session_transaction() as sess:
+        st = web.STORE[sess["sid"]]
+    assert st["query"] is None and st["reviewed"] == []
+
+    # 清空回放：全部清除
+    r = c.post("/reset", follow_redirects=True)
+    assert "清空回放" in r.get_data(as_text=True)
+    with c.session_transaction() as sess:
+        st = web.STORE[sess["sid"]]
+    assert st["data"] is None and st["query"] is None and st["reviewed"] == []
+
+    # 无数据时检索被拦截
+    r = c.post("/search", data={"start_min": "40", "end_min": "51",
+                                "max_dist": "20", "quota": "10"},
                follow_redirects=True)
-    assert "重叠" in r.get_data(as_text=True)
-    print("ok  网页端冒烟测试")
+    assert "请先上传" in r.get_data(as_text=True)
+
+    # CSV 校验：分钟号不连续，上传失败不会覆盖当前数据
+    c.post("/upload", data={"file": (_io.BytesIO(to_csv().encode()), "good.csv")},
+           content_type="multipart/form-data", follow_redirects=True)
+    r = c.post(
+        "/upload",
+        data={"file": (_io.BytesIO(b"minute,score\n1,50\n3,60\n"), "bad.csv")},
+        content_type="multipart/form-data", follow_redirects=True)
+    assert "分钟号不连续" in r.get_data(as_text=True)
+    with c.session_transaction() as sess:
+        st = web.STORE[sess["sid"]]
+    assert st["data"] is not None and st["data"]["name"] == "good.csv"
+    print("ok  网页端冒烟测试（检索/复核重选/失败回滚/旧 token/换 CSV/清空）")
 
 
 def main():
-    test_compute_alerts()
+    test_dtw_basic()
+    test_dtw_band_effect()
     rng = random.Random(20261124)
-    test_max_matching_vs_brute(rng)
-    test_min_hits_vs_brute(rng)
-    test_solve_vs_linear(rng)
-    test_monotonicity(rng)
-    test_edge_cases()
+    test_find_candidates(rng)
+    test_select_vs_brute(rng)
+    test_select_objective_order()
     test_web_app()
     print("\n全部自测通过。")
 

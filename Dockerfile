@@ -6,6 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py core.py sample_data.py ./
 COPY templates/ templates/
+COPY sample_data.csv ./
 
 ENV SECRET_KEY=change-me-in-prod PORT=5000
 EXPOSE 5000
