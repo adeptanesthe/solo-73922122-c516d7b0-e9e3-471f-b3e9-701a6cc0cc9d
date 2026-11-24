@@ -1,0 +1,6 @@
+.git
+__pycache__/
+*.pyc
+tests.py
+sample_data.csv
+README.md
